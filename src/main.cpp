@@ -20,6 +20,7 @@
 //    w 爆闪      p 策略          s 状态          z 开关深度睡眠
 //    l 音频库    n 下一条        f <文件名>       u <url> 试播云端
 //    x 停止      r 断 MQTT       e 回放事件日志 /events.csv
+//    q 查看离线事件队列（M1）
 //    ★ 只要有串口输入，睡眠就会往后推，方便桌面调试
 // ============================================================
 #include <Arduino.h>
@@ -38,6 +39,7 @@
 #include "audio_out.h"
 #include "policy.h"
 #include "wav_play.h"
+#include "event_queue.h"
 #include "http_audio.h"
 #include "sound_bank.h"
 #include "led_strip.h"
@@ -108,17 +110,15 @@ static void rgbPower(bool on) {
 }
 
 static void publishEvent(const char *event, const char *detail) {
-  if (!mqtt.connected()) return;
-  char buf[192];
-  snprintf(buf, sizeof(buf),
-           "{\"event\":\"%s\",\"detail\":\"%s\",\"policy\":\"%s\",\"uptime_ms\":%lu,\"rssi\":%d}",
-           event, detail, policy.name.c_str(), (unsigned long)millis(), WiFi.RSSI());
-  mqtt.publish(topicEvent.c_str(), buf);
+  // M1：连着就发（offline:false），断着进队列，恢复后自动补报（offline:true）
+  evq::submit(mqtt, topicEvent, policy.name, event, detail);
 }
 
 static void printStatus() {
   Serial.println("  ┌── 运行状态 ─────────────────────");
   Serial.printf("  │ 唤醒原因  : %s\n", power.causeText());
+  Serial.printf("  │ 事件队列  : %u 条排队 / 累计挤掉 %lu 条\n",
+                evq::pending(), evq::dropped());
   Serial.printf("  │ 运行时间  : %lus\n", (unsigned long)(millis() / 1000));
   Serial.printf("  │ 清醒窗口  : %lds 后睡觉\n",
                 (long)((int32_t)(awakeUntil - millis()) / 1000));
@@ -479,6 +479,10 @@ static void handleSerial() {
         Serial.println("[CMD] 回放事件日志");
         elog.dumpAll();
         break;
+      case 'q':
+        Serial.println("[CMD] 查看离线事件队列");
+        evq::dump();
+        break;
       case 'f':
       case 'u': {
         String arg = Serial.readStringUntil('\n');
@@ -513,8 +517,8 @@ static bool canSleep() {
   if (hadSerialAct && (millis() - lastSerialAct) < 60000UL) return false;  // 有人在调
   if (millis() < 3000UL) return false;                              // 至少醒 3 秒，让日志出来
   if (millis() >= awakeUntil) return true;                          // 窗口到了，不管有没有连上网
-  // 事件报完 + MQTT 稳了一小会儿 -> 可以提前睡，省电
-  if (!didWakeEvent && mqtt.connected() && mqttReadyAt &&
+  // 事件报完 + 队列倒空 + MQTT 稳了一小会儿 -> 可以提前睡，省电
+  if (!didWakeEvent && evq::pending() == 0 && mqtt.connected() && mqttReadyAt &&
       (millis() - mqttReadyAt > 1500UL)) return true;
   return false;
 }
@@ -553,6 +557,7 @@ void setup() {
   delay(30);                 // 深睡唤醒要快，不能像平常那样等 400ms
 
   power.begin();
+  evq::begin();              // 离线事件队列清零（M1）
 
   if (power.cause() == WAKE_COLD) {
     Serial.println();
@@ -759,11 +764,17 @@ void loop() {
     Serial.println("[自检] ✓ 完成。串口命令仍可用: b试听 t触发 w爆闪 s状态 l音频库");
   }
 
-  // 触发事件补报：等 MQTT 连上再发
-  if (didWakeEvent && mqtt.connected()) {
+  // —— 离线事件补报：MQTT 连着就按顺序慢慢倒（150ms 一条，别冲着代理）——
+  static uint32_t lastDrain = 0;
+  if (mqtt.connected() && evq::pending() && millis() - lastDrain > 150) {
+    lastDrain = millis();
+    evq::drainOne(mqtt, topicEvent, policy.name);
+  }
+
+  // 触发事件：直接交队列（连着就发，断着就排队，恢复自动补报）
+  if (didWakeEvent) {
     publishEvent("pir_trigger", pendingZone.c_str());
     didWakeEvent = false;
-    Serial.println("[MQTT] 触发事件已上报");
   }
 
   // —— NTP：连上网后把真实时间喂给事件日志（每次开机只写一次 NVS）——

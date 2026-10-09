@@ -32,7 +32,9 @@ public:
   // SD 后来才挂上（bank.retrySD() 成功后调用）-> 补挂 + 清空缓冲
   void setFS(fs::FS *fs);
 
-  void log(const char *zone, const char *file, const char *result);
+  // detail 非空时作为第 8 列追加（AI 行用：置信度/温湿度/电池），内容里不能带逗号
+  void log(const char *zone, const char *file, const char *result,
+           const char *detail = "");
 
   // NTP 同步成功后把当前纪元喂进来（内部去重：同一秒只存一次）
   // 会写入 NVS，深睡/断电重启后还能推出大致时间

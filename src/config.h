@@ -53,6 +53,7 @@
 #define PIN_AI_RX            18
 #define AI_UART_BAUD         115200
 #define AI_RESULT_TIMEOUT_MS  5000UL   // 发 capture 后等识别结果的时限，超时自动放弃
+#define AI_CONF_SPECIFIC      0.70f    // ≥它才切换专属音频；0.4~0.7 通用驱赶音继续响；<0.4 视觉板直接报 unknown
 
 // —— V2：OLED 状态屏（I2C 0x3C，与 AHT10 同总线）——
 #define OLED_W           128

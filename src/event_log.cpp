@@ -36,7 +36,8 @@ void EventLog::setFS(fs::FS *fs) {
 }
 
 // ---------------------------------------------------------------- 记录
-void EventLog::log(const char *zone, const char *file, const char *result) {
+void EventLog::log(const char *zone, const char *file, const char *result,
+                   const char *detail) {
   char db[16] = "----", tb[12] = "--:--:--";
   const char *src = "none";
 
@@ -49,9 +50,13 @@ void EventLog::log(const char *zone, const char *file, const char *result) {
     src = "est";
   }
 
-  char line[176];
-  snprintf(line, sizeof(line), "%s,%s,%s,%s,%s,%s,%lu",
-           db, tb, zone, file, result, src, (unsigned long)millis());
+  char line[240];
+  if (detail && detail[0])
+    snprintf(line, sizeof(line), "%s,%s,%s,%s,%s,%s,%lu,%s",
+             db, tb, zone, file, result, src, (unsigned long)millis(), detail);
+  else
+    snprintf(line, sizeof(line), "%s,%s,%s,%s,%s,%s,%lu",
+             db, tb, zone, file, result, src, (unsigned long)millis());
 
   Serial.printf("[日志] %s %s | %s | %s%s\n", db, tb, zone, file,
                 result, _fs ? "" : "  (SD 未挂载，暂存内存)");

@@ -81,11 +81,19 @@ bool AiLink::handleLine(const char *line, AiHit &out)
 
         int cls = findClass(en);
         if (cls < 0) {
-            // unknown / 未收录动物：按约定不驱赶（人类、宠物等都在这里）
-            if (wasAwaiting)
-                Serial.printf("[AI<-] 非目标(%s)：按约定不驱赶，仅留串口记录\n", en);
-            else
-                Serial.printf("[AI<-] 非请求期的主动上报(%s)，忽略\n", en);
+            // unknown / 未收录动物：按约定不驱赶（人类、宠物等都在这里），
+            // 但要交回 main 记一条日志（out.cls = AN_COUNT 即"非目标"约定）
+            if (wasAwaiting) {
+                Serial.printf("[AI<-] 非目标(%s)：不驱赶，交 main 记日志\n", en);
+                out.cls   = AN_COUNT;
+                out.en    = en;
+                out.cn    = "未知";
+                out.audio = "----";
+                out.r = out.g = out.b = 0;
+                out.conf = doc["confidence"] | 0.0f;
+                return true;
+            }
+            Serial.printf("[AI<-] 非请求期的主动上报(%s)，忽略\n", en);
             return false;
         }
         if (!wasAwaiting) {

@@ -12,9 +12,10 @@ class OledUi {
 public:
     void begin();
     bool ok() const { return _ok; }
-    void aiResult(const char *animalEn, float conf);  // 识别结果页，约 6s 后自动回待机页
-    void idle();                                      // 待机页
-    void tick();                                      // 主循环推动：结果页超时回退
+    // 识别结果页：动物名(大字) + 置信度% + 时间，约 6s 后自动回待机页
+    void aiResult(const char *animalEn, float conf, const char *timeStr);
+    void idle(uint32_t upSec);                        // 待机页：系统名 + 运行时长
+    void tick();                                      // 主循环推动：结果页超时回待机
 
 private:
     bool     _ok = false;

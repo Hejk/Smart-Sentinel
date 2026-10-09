@@ -19,8 +19,9 @@ extern const char*   ANIMAL_WAV[AN_COUNT];     // /sounds/ 里的专属音频文
 extern const uint8_t ANIMAL_RGB[AN_COUNT][3];  // 识别到后的驱赶灯色
 
 // 一次识别结果（poll 返回 true 时有效）
+// 约定：cls == AN_COUNT 表示"非目标"（unknown/人类/宠物），只记录不驱赶
 struct AiHit {
-    uint8_t    cls;       // AnimalClass
+    uint8_t    cls;       // AnimalClass；AN_COUNT = 非目标
     const char *en;       // "wild_boar"
     const char *cn;       // "野猪"
     const char *audio;    // "wild_boar.wav"

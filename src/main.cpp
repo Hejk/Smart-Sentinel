@@ -221,36 +221,71 @@ static String logZoneName(const char *source, int zone) {
   return String("----");
 }
 
+// NTP 对上后给 OLED 提供当前时刻 HH:MM:SS，否则给占位
+static String clockText() {
+  time_t n = time(nullptr);
+  if (n > 1600000000) {
+    struct tm tmv;
+    localtime_r(&n, &tmv);
+    char b[12];
+    snprintf(b, sizeof(b), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    return String(b);
+  }
+  return String("--:--:--");
+}
+
 // ------------------------------------------------------------ V2：AI 识别结果落地
-// 二段式驱赶：PIR 先响通用音效（不依赖视觉板），识别结果异步回来后：
-//   ① 库里有专属音频 -> 打断通用音效，换专属音频（野猪叫对野猪更有效）
-//   ② 专属灯色爆闪   ③ OLED 显示   ④ 上报云端（断网进 evq 队列）
+// 二段式驱赶 + 置信度三档（AI_CONF_SPECIFIC=0.7）：
+//   ≥0.7 → 切专属音频；0.4~0.7 → PIR 触发时的通用驱赶音继续响（不切换）；
+//   <0.4 → 视觉板直接报 unknown。
+//   unknown（人类/宠物/未收录）→ 只记日志，不发声不亮灯（约定不驱赶）
 static void onAiResult(const AiHit &hit) {
   Serial.printf("\n[AI] 识别结果: %s (%s)  置信度 %.0f%%\n", hit.en, hit.cn, hit.conf * 100.0f);
 
   const char *zone = pendingZone.length() ? pendingZone.c_str() : "AI";
 
-  // ① 专属音频
+  // —— 日志明细第 8 列：置信度/温湿度/电池（电池未接，等 18650+ADC 上线再补）——
+  float tC = 0, rh = 0;
+  bool climateOk = cbReadClimate(tC, rh);
+  char logDetail[96];
+  if (climateOk)
+    snprintf(logDetail, sizeof(logDetail), "conf=%.2f;temp=%.1fC;rh=%.0f%%;bat=----",
+             hit.conf, tC, rh);
+  else
+    snprintf(logDetail, sizeof(logDetail), "conf=%.2f;temp=----;rh=----;bat=----", hit.conf);
+
+  // —— 非目标：只记录，不发声不亮灯 ——
+  if (hit.cls == AN_COUNT) {
+    elog.log(zone, "----", "ai-unknown", logDetail);
+    if (oled.ok()) oled.aiResult(hit.en, hit.conf, clockText().c_str());
+    return;
+  }
+
+  // ① 音频分档：≥0.7 才换专属；0.4~0.7 通用音效继续
   int idx = bank.find(hit.audio);
+  const char *logResult = "ai-generic";          // 0.4~0.7：通用驱赶音继续响
   bool switched = false;
-  if (idx >= 0 && policy.enabled && policy.mode != "mute") {
+  if (idx >= 0 && policy.enabled && policy.mode != "mute" && hit.conf >= AI_CONF_SPECIFIC) {
     if (playingNow) stopPlayback();               // 打断通用音效，换专属音频
     switched = playLocal(idx);
     if (switched) {
-      elog.log(zone, hit.audio, "ai-start");
+      logResult = "ai-start";
       activeUntil = millis() + policy.holdMs;     // 保持时间重算
       waking = true;
       digitalWrite(PIN_LED, HIGH);
     }
   }
   if (idx < 0) {
+    logResult = "ai-nomatch";
     Serial.printf("[AI] 音频库没有 %s —— 传一个进 /sounds 就能自动命中\n", hit.audio);
-    elog.log(zone, hit.audio, "ai-nomatch");
   } else if (!switched) {
-    elog.log(zone, hit.audio, "ai-skip");         // 静音策略或播放失败，只记录
+    if (hit.conf >= AI_CONF_SPECIFIC) logResult = "ai-skip";  // 播放失败/静音策略
+    Serial.printf("[AI] 置信度 %.2f 未达 %.2f 或不可播 → 通用驱赶音继续\n",
+                  hit.conf, (double)AI_CONF_SPECIFIC);
   }
+  elog.log(zone, hit.audio, logResult, logDetail);
 
-  // ② 专属灯色
+  // ② 专属灯色（未知不亮：unknown 在上面已提前 return）
   if (rgb.ready()) {
     if (policy.flash)
       rgb.strobe(hit.r, hit.g, hit.b, policy.flashCount, policy.flashMs, policy.flashMs);
@@ -258,15 +293,15 @@ static void onAiResult(const AiHit &hit) {
       rgb.blip(hit.r, hit.g, hit.b, 120);
   }
 
-  // ③ OLED（没接自动跳过）
-  if (oled.ok()) oled.aiResult(hit.en, hit.conf);
+  // ③ OLED：动物名(大字) + 置信度 + 时间（没接自动跳过）
+  if (oled.ok()) oled.aiResult(hit.en, hit.conf, clockText().c_str());
 
   // ④ 云端上报（evq：断网自动排队，恢复补报）
-  char detail[160];
-  snprintf(detail, sizeof(detail),
+  char mqDetail[160];
+  snprintf(mqDetail, sizeof(mqDetail),
            "animal=%s,label_cn=%s,confidence=%.2f,audio=%s,played=%s",
            hit.en, hit.cn, hit.conf, hit.audio, switched ? "true" : "false");
-  publishEvent("ai_result", detail);
+  publishEvent("ai_result", mqDetail);
 }
 
 // ------------------------------------------------------------ 唤醒 -> 立刻出声

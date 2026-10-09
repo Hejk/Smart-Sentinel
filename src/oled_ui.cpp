@@ -12,10 +12,10 @@ void OledUi::begin()
         return;
     }
     Serial.printf("[OLED] ✓ %dx%d 就绪 @0x%02X\n", OLED_W, OLED_H, OLED_ADDR);
-    idle();
+    idle(millis() / 1000);
 }
 
-void OledUi::idle()
+void OledUi::idle(uint32_t upSec)
 {
     if (!_ok) return;
     s_disp.clearDisplay();
@@ -25,13 +25,18 @@ void OledUi::idle()
     s_disp.println("Smart Sentinel");
     s_disp.setCursor(0, 12);
     s_disp.println("v2 + AI vision");
+    char b[28];
+    snprintf(b, sizeof(b), "up %02lu:%02lu:%02lu",
+             (unsigned long)(upSec / 3600),
+             (unsigned long)((upSec / 60) % 60),
+             (unsigned long)(upSec % 60));
     s_disp.setCursor(0, 30);
-    s_disp.println("standby...");
+    s_disp.println(b);
     s_disp.display();
     _onEvent = false;
 }
 
-void OledUi::aiResult(const char *animalEn, float conf)
+void OledUi::aiResult(const char *animalEn, float conf, const char *timeStr)
 {
     if (!_ok) return;
     s_disp.clearDisplay();
@@ -39,6 +44,8 @@ void OledUi::aiResult(const char *animalEn, float conf)
     s_disp.setTextSize(1);
     s_disp.setCursor(0, 0);
     s_disp.print("AI DETECT");
+    s_disp.setCursor(78, 0);
+    s_disp.print(timeStr);                        // NTP 未同步时是 --:--:--
     s_disp.setTextSize(2);                       // "wild_boar" 9字 x 12px = 108px，装得下
     s_disp.setCursor(0, 14);
     s_disp.println(animalEn);
@@ -59,5 +66,5 @@ void OledUi::aiResult(const char *animalEn, float conf)
 
 void OledUi::tick()
 {
-    if (_ok && _onEvent && (int32_t)(millis() - _pageUntil) >= 0) idle();
+    if (_ok && _onEvent && (int32_t)(millis() - _pageUntil) >= 0) idle(millis() / 1000);
 }

@@ -69,22 +69,31 @@ bool AiLink::handleLine(const char *line, AiHit &out)
     const char *type = doc["type"] | "";
     if (strcmp(type, "result") == 0) {
         const char *en = doc["animal"] | "";
+
+        // 只要回的是 result，视觉板就是有响应的：等待标志先收掉，
+        // 免得 unknown（不驱赶的目标）回来后还傻等到超时
+        bool wasAwaiting = _awaiting;
+        if (wasAwaiting) {
+            _awaiting = false;
+            _lastResultMs = millis();
+            _recv++;
+        }
+
         int cls = findClass(en);
         if (cls < 0) {
-            Serial.printf("[AI<-] 未知动物 \"%s\"，忽略\n", en);
+            // unknown / 未收录动物：按约定不驱赶（人类、宠物等都在这里）
+            if (wasAwaiting)
+                Serial.printf("[AI<-] 非目标(%s)：按约定不驱赶，仅留串口记录\n", en);
+            else
+                Serial.printf("[AI<-] 非请求期的主动上报(%s)，忽略\n", en);
             return false;
         }
-        if (!_awaiting) {
+        if (!wasAwaiting) {
             // 视觉板自检模式（AUTO_CAPTURE_SEC>0）的主动上报：记数但不动作，
             // 否则田野里没人触发它也会 10 秒吼一次
             Serial.println("[AI<-] 非请求期的主动上报，忽略（不播放/不爆闪）");
-            _recv++;
-            _lastResultMs = millis();
             return false;
         }
-        _awaiting = false;
-        _lastResultMs = millis();
-        _recv++;
         out.cls   = (uint8_t)cls;
         out.en    = ANIMAL_EN[cls];
         out.cn    = ANIMAL_CN[cls];

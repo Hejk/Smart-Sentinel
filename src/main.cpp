@@ -47,6 +47,8 @@
 #include "policy_store.h"
 #include "event_log.h"
 #include "serial_cmd.h"
+#include "ai_link.h"
+#include "oled_ui.h"
 
 PirZones     pir;
 AudioOut     audio;
@@ -58,6 +60,8 @@ Power        power;
 PolicyStore  store;
 EventLog     elog;                 // 事件日志：触发记录追加写 SD 卡 /events.csv
 SerialCmd    serialCmd;            // 后台串口协议：一行一条 JSON 指令（7 条，见 docs）
+AiLink       ai;                   // V2：AI 视觉板 UART1 链路（发抓拍命令 / 收识别结果）
+OledUi       oled;                 // V2：OLED 状态屏（没接自动跳过）
 Adafruit_AHTX0 aht;                 // AHT10 温湿度
 bool          ahtOk = false;
 WiFiClient   net;
@@ -135,6 +139,9 @@ static void printStatus() {
   Serial.printf("  │ MQTT      : %s   策略已同步:%s\n",
                 mqtt.connected() ? "已连接" : "未连接", policySynced ? "是" : "否");
   Serial.printf("  │ 本地音频  : %d 条, 来源=%s\n", bank.count(), bank.backendName());
+  Serial.printf("  │ AI视觉板  : %s   发%lu/收%lu\n",
+                ai.statusText(), (unsigned long)ai.sentCount(), (unsigned long)ai.recvCount());
+  Serial.printf("  │ OLED 屏   : %s\n", oled.ok() ? "就绪 0x3C" : "未接(跳过)");
   Serial.printf("  │ 事件日志  : %s   时间:%s   内存缓冲:%d 条\n",
                 bank.sdMounted() ? "/events.csv (SD)" : "内存中(SD未挂载)",
                 elog.timeValid() ? "已同步" : "未同步", elog.buffered());
@@ -214,6 +221,54 @@ static String logZoneName(const char *source, int zone) {
   return String("----");
 }
 
+// ------------------------------------------------------------ V2：AI 识别结果落地
+// 二段式驱赶：PIR 先响通用音效（不依赖视觉板），识别结果异步回来后：
+//   ① 库里有专属音频 -> 打断通用音效，换专属音频（野猪叫对野猪更有效）
+//   ② 专属灯色爆闪   ③ OLED 显示   ④ 上报云端（断网进 evq 队列）
+static void onAiResult(const AiHit &hit) {
+  Serial.printf("\n[AI] 识别结果: %s (%s)  置信度 %.0f%%\n", hit.en, hit.cn, hit.conf * 100.0f);
+
+  const char *zone = pendingZone.length() ? pendingZone.c_str() : "AI";
+
+  // ① 专属音频
+  int idx = bank.find(hit.audio);
+  bool switched = false;
+  if (idx >= 0 && policy.enabled && policy.mode != "mute") {
+    if (playingNow) stopPlayback();               // 打断通用音效，换专属音频
+    switched = playLocal(idx);
+    if (switched) {
+      elog.log(zone, hit.audio, "ai-start");
+      activeUntil = millis() + policy.holdMs;     // 保持时间重算
+      waking = true;
+      digitalWrite(PIN_LED, HIGH);
+    }
+  }
+  if (idx < 0) {
+    Serial.printf("[AI] 音频库没有 %s —— 传一个进 /sounds 就能自动命中\n", hit.audio);
+    elog.log(zone, hit.audio, "ai-nomatch");
+  } else if (!switched) {
+    elog.log(zone, hit.audio, "ai-skip");         // 静音策略或播放失败，只记录
+  }
+
+  // ② 专属灯色
+  if (rgb.ready()) {
+    if (policy.flash)
+      rgb.strobe(hit.r, hit.g, hit.b, policy.flashCount, policy.flashMs, policy.flashMs);
+    else
+      rgb.blip(hit.r, hit.g, hit.b, 120);
+  }
+
+  // ③ OLED（没接自动跳过）
+  if (oled.ok()) oled.aiResult(hit.en, hit.conf);
+
+  // ④ 云端上报（evq：断网自动排队，恢复补报）
+  char detail[160];
+  snprintf(detail, sizeof(detail),
+           "animal=%s,label_cn=%s,confidence=%.2f,audio=%s,played=%s",
+           hit.en, hit.cn, hit.conf, hit.audio, switched ? "true" : "false");
+  publishEvent("ai_result", detail);
+}
+
 // ------------------------------------------------------------ 唤醒 -> 立刻出声
 // 顺序很重要：
 //   1) 先把声音和闪光放出来（本地，毫秒级）
@@ -227,6 +282,11 @@ static void doWake(const char *source, int zone) {
   const char *zoneName = (zone >= 0 && zone < (int)PirZones::COUNT)
                            ? PirZones::name((uint8_t)zone) : "无分区";
   String logZone = logZoneName(source, zone);      // 写进 /events.csv 的分区名
+
+  // V2：让视觉板同步抓拍识别（结果异步回来，在 onAiResult 里接；
+  //     视觉板不在线也不影响下面的通用驱赶流程，超时自动放弃）
+  ai.requestCapture(zoneName);
+
   Serial.printf("\n[唤醒] 来源=%s  分区=%s  t=%lums  保持 %lums\n",
                 source, zoneName, (unsigned long)now, (unsigned long)policy.holdMs);
   printPolicy(policy);
@@ -483,6 +543,10 @@ static void handleSerial() {
         Serial.println("[CMD] 查看离线事件队列");
         evq::dump();
         break;
+      case 'c':
+        Serial.println("[CMD] 手动向视觉板发 {\"cmd\":\"capture\"}（台架联调用）");
+        ai.requestCapture("串口");
+        break;
       case 'f':
       case 'u': {
         String arg = Serial.readStringUntil('\n');
@@ -514,6 +578,7 @@ static void handleSerial() {
 static bool canSleep() {
   if (!power.sleepEnabled()) return false;
   if (playingNow) return false;                                     // 还在放音
+  if (ai.awaiting()) return false;                                  // 还在等视觉板识别结果
   if (hadSerialAct && (millis() - lastSerialAct) < 60000UL) return false;  // 有人在调
   if (millis() < 3000UL) return false;                              // 至少醒 3 秒，让日志出来
   if (millis() >= awakeUntil) return true;                          // 窗口到了，不管有没有连上网
@@ -570,6 +635,8 @@ void setup() {
     Serial.printf(" I2S -> GPIO%d/%d/%d    SD -> CS%d SCK%d MISO%d MOSI%d\n",
                   PIN_I2S_BCLK, PIN_I2S_LRC, PIN_I2S_DIN,
                   PIN_SD_CS, PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI);
+    Serial.printf(" AI  -> UART1 TX%d/RX%d (视觉板)   OLED -> 0x%02X@SDA%d/SCL%d\n",
+                  PIN_AI_TX, PIN_AI_RX, OLED_ADDR, PIN_I2C_SDA, PIN_I2C_SCL);
     Serial.println("============================================");
   }
   power.printWakeInfo();
@@ -617,6 +684,11 @@ void setup() {
   } else {
     Serial.println("[AHT10] ✗ 未找到（0x38 无应答）—— 检查 SDA/SCL/VCC/GND 四根线");
   }
+
+  // 4.7) V2：AI 视觉板链路 + OLED 状态屏（都没接好也不影响 v1 功能）
+  ai.begin();
+  oled.begin();
+  ai.ping();          // 链路自检：视觉板在线会回 pong
 
   // 5) 先把上次存的策略读回来（深睡会把 RAM 清空）
   store.begin();
@@ -687,12 +759,18 @@ void setup() {
     audio.chime();
     ampEnable(false);
   }
-  Serial.println("[启动] 完成。命令: b试听 t触发 g<1-3>分区 w爆闪 z睡眠开关 p/s/l/e/n/f/u/x/r");
+  Serial.println("[启动] 完成。命令: b试听 c抓拍 t触发 g<1-3>分区 w爆闪 z睡眠开关 p/s/l/e/n/f/u/x/r");
   Serial.println("[启动] 后台协议: {\"cmd\":\"get_status\"} 等 7 条 JSON 指令，见 docs/20-后台串口协议.md");
 }
 
 void loop() {
   handleSerial();
+
+  // —— V2：AI 视觉板识别结果（异步，二段式驱动的第二段）——
+  AiHit aiHit;
+  if (ai.poll(aiHit)) onAiResult(aiHit);
+  oled.tick();
+
   loopWifi();
   loopMqtt();
 

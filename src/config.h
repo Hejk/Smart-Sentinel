@@ -47,6 +47,18 @@
 #define PIN_I2C_SDA     8
 #define PIN_I2C_SCL     7
 
+// —— V2：AI 视觉主控（ESP32-S3_1）互联 UART1 ——
+// 交叉接线：本板 TX17 → 视觉板 RX18；视觉板 TX17 → 本板 RX18
+#define PIN_AI_TX            17
+#define PIN_AI_RX            18
+#define AI_UART_BAUD         115200
+#define AI_RESULT_TIMEOUT_MS  5000UL   // 发 capture 后等识别结果的时限，超时自动放弃
+
+// —— V2：OLED 状态屏（I2C 0x3C，与 AHT10 同总线）——
+#define OLED_W           128
+#define OLED_H           64          // 0.96寸 128x64；若屏是 128x32 改这里
+#define OLED_ADDR        0x3C
+
 // ============================================================
 //  WiFi —— 调试阶段用；田野部署时换成 4G 模块（只换链路层）
 // ============================================================

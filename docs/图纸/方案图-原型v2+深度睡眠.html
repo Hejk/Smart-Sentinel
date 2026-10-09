@@ -1,0 +1,92 @@
+<!-- visual-frame {"title":"原型 v2 + 深度睡眠 · 三分区驱赶节点","w":1020,"h":700} -->
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:16px 18px;font-size:12px}
+h1{font-size:17px;font-weight:600}
+.sub{font-size:11.5px;color:#7d8590;margin-top:3px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:12px 13px}
+.card h2{font-size:12px;color:#58a6ff;font-weight:600;margin-bottom:9px}
+.grid{display:grid;grid-template-columns:1.05fr 1fr;gap:13px;margin-top:13px}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+td,th{padding:4px 5px;text-align:left;border-bottom:1px solid #1f242c;vertical-align:top;line-height:1.45}
+th{color:#7d8590;font-weight:500;font-size:10.5px}
+.p{color:#f0b429;font-family:ui-monospace,Menlo,monospace}
+.good{color:#3fb950}.bad{color:#f85149}.mid{color:#d29922}
+.tl{display:flex;flex-direction:column;gap:6px}
+.tlrow{display:flex;gap:8px;align-items:flex-start}
+.dot{flex:0 0 8px;height:8px;border-radius:50%;margin-top:4px}
+.d1{background:#30363d}.d2{background:#f0b429}.d3{background:#3fb950}.d4{background:#58a6ff}.d5{background:#8957e5}
+.tlb{color:#8b949e;font-size:10.5px}
+.key{background:#0f2a17;border:1px solid #23863655;border-radius:10px;padding:10px 13px;line-height:1.6;margin-top:13px}
+.key b{color:#7ee787}
+.warn{background:#2a1215;border:1px solid #f8514955;border-radius:10px;padding:10px 13px;line-height:1.6;margin-top:13px}
+.warn b{color:#ff7b72}
+code{background:#1f242c;padding:1px 5px;border-radius:4px;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#79c0ff}
+</style></head><body>
+<h1>原型 v2 + 深度睡眠 · 三分区驱赶节点</h1>
+<div class="sub">触发瞬间不联网：声音和闪光都是本地的；醒来才联网，办完事就睡</div>
+
+<div class="grid">
+<div class="card">
+<h2>▍一次触发的完整生命周期</h2>
+<div class="tl">
+<div class="tlrow"><div class="dot d1"></div><div><b>深度睡眠</b><div class="tlb">ESP32 断电级休眠；PIR 接 5V 常电，一直在监听</div></div></div>
+<div class="tlrow"><div class="dot d2"></div><div><b>PIR 拉高 → 芯片复位</b> 约 0.3 秒<div class="tlb">ext1 唤醒同时告诉我们"是哪个脚触发的"，直接得到分区</div></div></div>
+<div class="tlrow"><div class="dot d3"></div><div><b>立刻出声</b> 毫秒级<div class="tlb">从 TF 卡读 → 爆闪 + 分区专属音频。此刻还没连网</div></div></div>
+<div class="tlrow"><div class="dot d4"></div><div><b>再联网</b> 约 5 秒<div class="tlb">上报事件 → 收云端策略 → 存进 NVS</div></div></div>
+<div class="tlrow"><div class="dot d5"></div><div><b>回睡：先进冷却期</b><div class="tlb">只开定时器、关掉 PIR 唤醒，睡 cooldown_ms 那么久</div></div></div>
+</div>
+<div style="font-size:11px;color:#8b949e;margin-top:9px">
+冷却为什么要这样做：深睡后没有时钟，"上次触发到现在多久"算不出来。<br>
+改成用"睡多久"当冷却窗口，顺带解决了另一个坑 —— 动物赖着不走时，
+PIR 每 2.5 秒唤醒一次会把电池吃干。
+</div>
+</div>
+
+<div class="card">
+<h2>▍功耗账（估算，到货必实测）</h2>
+<table>
+<tr><th>状态</th><th>电流</th><th>每天</th></tr>
+<tr><td>深度睡眠</td><td class="p">µA~几百µA</td><td>~2 mAh</td></tr>
+<tr><td>PIR ×3 常驻</td><td class="p">~200µA</td><td>~5 mAh</td></tr>
+<tr><td>触发工作 15s × 30 次</td><td class="p">~120mA</td><td>~15 mAh</td></tr>
+<tr><td><b>合计（达标值）</b></td><td></td><td class="good"><b>~22 mAh/天</b></td></tr>
+</table>
+<div style="font-size:11px;color:#8b949e;margin:8px 0 4px">还没处理掉的三个常耗电大户：</div>
+<table>
+<tr><td>WS2812 关灯态 8 颗</td><td class="bad">5~8 mA</td><td>MOS 门控 5V</td></tr>
+<tr><td>MAX98357 SD 悬空</td><td class="mid">几 mA</td><td>SD 接 GPIO</td></tr>
+<tr><td>开发板 LDO+串口芯</td><td class="bad">1~10 mA</td><td>田野版换低 IQ</td></tr>
+</table>
+<div style="font-size:11px;color:#8b949e;margin-top:6px">这三项不解决，前面省的电全白费。代码里已留好开关。</div>
+</div>
+</div>
+
+<div class="card" style="margin-top:13px">
+<h2>▍路线图</h2>
+<table>
+<tr><th>阶段</th><th>状态</th><th>说明</th></tr>
+<tr><td>1 最小系统</td><td class="good">代码就绪</td><td>PIR 唤醒 + LED + 提示音 + MQTT 策略</td></tr>
+<tr><td>2 云端音频</td><td class="good">代码就绪</td><td>HTTP 拉 WAV → I2S</td></tr>
+<tr><td>3a 本地音频</td><td class="good">代码就绪</td><td>TF 卡优先、板载 Flash 兜底、随机轮换</td></tr>
+<tr><td>3b 分区 + 视觉驱赶</td><td class="good">代码就绪</td><td>3 路 PIR 分区曲库 + WS2812 爆闪</td></tr>
+<tr><td>3c 深度睡眠</td><td class="good">本轮完成</td><td>唤醒即播、播完联网、冷却睡；策略存 NVS</td></tr>
+<tr><td>4 功率收尾</td><td class="mid">待做</td><td>灯带/功放门控 + 低 IQ 供电 + 太阳能充电</td></tr>
+<tr><td>5 4G 联网</td><td class="mid">待做</td><td>Air780E 包成 Client，MQTT 层不动</td></tr>
+<tr><td>6 雷达补鸟 / OTA</td><td class="mid">待做</td><td>PIR 对鸟无效，仍需微波雷达</td></tr>
+</table>
+</div>
+
+<div class="key">
+<b>本轮完成：</b>深睡唤醒即播放、事件补报、策略 NVS 持久化、
+"睡眠时长当冷却"、三个外设电源门控开关（接线即生效）。
+编译通过，固件 982KB / 1.5MB。
+</div>
+
+<div class="warn">
+<b>⚠ 桌面调试先敲 z 关掉深度睡眠。</b>
+否则开机 15 秒后它就睡了，睡着时串口完全没反应 —— 很容易误判成死机。
+只要有串口输入，睡眠会自动往后推 60 秒，正常调试不会被打断。
+</div>
+</body></html>

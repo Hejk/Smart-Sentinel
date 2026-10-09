@@ -1,0 +1,12 @@
+# ESP32-S3 8MB Flash 分区表 —— 双 OTA 槽 + 本地音频文件系统
+#
+# 为什么要双 OTA 槽：田野节点要能远程升级固件，
+#   不然改个参数就得爬一趟山去插 USB。
+# spiffs 分区（2.94MB）给 LittleFS 存音频，够放约 30 条 3 秒音效。
+#
+# name,     type, subtype,  offset,    size
+nvs,        data, nvs,      0x9000,    0x5000
+otadata,    data, ota,      0xe000,    0x2000
+app0,       app,  ota_0,    0x10000,   0x180000
+app1,       app,  ota_1,    0x190000,  0x180000
+spiffs,     data, spiffs,   0x310000,  0x2F0000

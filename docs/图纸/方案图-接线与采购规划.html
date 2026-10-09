@@ -1,0 +1,80 @@
+<!-- visual-frame {"title":"接线怎么改 · 采购与阶段规划","w":1020,"h":690} -->
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;padding:16px 18px;font-size:12px}
+h1{font-size:17px;font-weight:600}
+.sub{font-size:11.5px;color:#7d8590;margin-top:3px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:12px 13px}
+.card h2{font-size:12px;color:#58a6ff;font-weight:600;margin-bottom:9px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin-top:13px}
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+td,th{padding:4px 5px;text-align:left;border-bottom:1px solid #1f242c;vertical-align:top;line-height:1.45}
+th{color:#7d8590;font-weight:500;font-size:10.5px}
+.p{color:#f0b429;font-family:ui-monospace,Menlo,monospace}
+.good{color:#3fb950}.bad{color:#f85149}.mid{color:#d29922}
+.stage{display:flex;gap:9px;margin-bottom:10px}
+.num{flex:0 0 22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600}
+.now{background:#238636;color:#fff}
+.next{background:#1c2b3a;color:#79c0ff;border:1px solid #1f6feb55}
+.stage b{color:#e6edf3}
+.stage p{color:#8b949e;font-size:11px;margin-top:2px;line-height:1.5}
+.key{background:#0f2a17;border:1px solid #23863655;border-radius:10px;padding:10px 13px;line-height:1.65;margin-top:13px}
+.key b{color:#7ee787}
+.warn{background:#1a1408;border:1px solid #9e6a0355;border-radius:10px;padding:10px 13px;line-height:1.65;margin-top:13px}
+.warn b{color:#f0b429}
+code{background:#1f242c;padding:1px 5px;border-radius:4px;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#79c0ff}
+</style></head><body>
+<h1>接线怎么改 · 采购要不要现在做</h1>
+<div class="sub">结论先说：调试期一律插面包板别焊；主器件现在就能买；会变的只有接线件和几个小元件</div>
+
+<div class="grid">
+<div class="card">
+<h2>▍三个阶段的接线方式（你现在在阶段 1）</h2>
+<div class="stage"><div class="num now">1</div><div><b>面包板 + 杜邦线（插接）← 现在这里</b>
+<p>改线 = 把线拔出来插到另一个孔，几秒钟，零成本、零风险。<br>
+工作台里画的接线就是这个形态，照着插就行。<br>
+<b style="color:#7ee787">只要还在调代码，就别焊。</b></p></div></div>
+<div class="stage"><div class="num next">2</div><div><b>洞洞板 / 面包板焊接（小批验证）</b>
+<p>功能全通了、不再改线了，再焊到洞洞板上装盒子。<br>
+这一阶段改线要吸锡器 + 重新焊，比较烦。</p></div></div>
+<div class="stage"><div class="num next">3</div><div><b>自制 PCB（定型量产）</b>
+<p>接线变成板子上的铜箔走线，改线 = 重新画板、重新打样。<br>
+只在前两阶段彻底稳定后才做。</p></div></div>
+</div>
+
+<div class="card">
+<h2>▍采购建议</h2>
+<table>
+<tr><th>类别</th><th>现在买?</th><th>说明</th></tr>
+<tr><td>ESP32-S3 / MAX98357 / 喇叭 / PIR / WS2812 / TF卡模块 / AHT10</td><td class="good">现在就买</td><td>这些跟接线方式无关，只会继续用</td></tr>
+<tr><td>18650 / TP4056 / 升压模块 / 太阳能板 / CN3791</td><td class="good">现在就买</td><td>供电方案已经定了</td></tr>
+<tr><td>面包板 + 杜邦线（公母各一把）</td><td class="good">多买</td><td>消耗品，插拔多了会接触不良</td></tr>
+<tr><td>MOS 管 / 二极管 / 电容 / 电阻 / 74AHCT125</td><td class="mid">顺手加一点</td><td>几块钱一堆，后面八成要用（灯带门控、电平转换）</td></tr>
+<tr><td>4G 模块 Air780E + 流量卡</td><td class="mid">可以等等</td><td>等前面全部实测通了再上，先别让变量变多</td></tr>
+<tr><td>微波雷达（补鸟用）</td><td class="bad">先别</td><td>型号还没定，先买 RCWL-0516 试灵敏度也行</td></tr>
+</table>
+</div>
+</div>
+
+<div class="key">
+<b>改线在代码那边有多便宜？</b><br>
+所有引脚都集中写在 <code>src/config.h</code> 一个文件里，一共十几行 <code>#define PIN_xxx</code>。
+你改完线，只改对应那几个数字，重新编译烧录就行 —— 其他代码一行都不用动。
+这就是为什么我一直强调"改线请同步改 config.h"。
+<br><br>
+<b>而且固件是"按功能"写的，不是"按引脚"写的：</b>
+换感应器（PIR → 雷达）、换存储（Flash → TF 卡）、换联网（WiFi → 4G），
+都是换一个模块文件，主逻辑不动。
+</div>
+
+<div class="warn">
+<b>建议的动手顺序：</b>
+① 先按现在的接线插到面包板上，把 1 → 3c 全部实测跑通<br>
+② 边测边记下"哪些线必须改"（比如功放 SD 要引 GPIO、灯带 5V 要串 MOS）<br>
+③ 等接线彻底不动了，再焊到洞洞板上装盒子<br>
+④ 焊完再测一轮，然后才考虑 PCB
+<br><br>
+★ 别反过来：先焊死再调代码，会把自己逼到每次改线都要动烙铁。
+</div>
+</body></html>

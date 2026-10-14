@@ -33,6 +33,7 @@
 #include <Adafruit_AHTX0.h>
 #include <SD.h>
 #include <time.h>
+#include "driver/gpio.h"
 
 #include "config.h"
 #include "pir_zones.h"
@@ -64,6 +65,7 @@ AiLink       ai;                   // V2：AI 视觉板 UART1 链路（发抓拍
 OledUi       oled;                 // V2：OLED 状态屏（没接自动跳过）
 Adafruit_AHTX0 aht;                 // AHT10 温湿度
 bool          ahtOk = false;
+uint8_t       bhAddr = 0;           // BH1750/1758 光照：实测应答地址（0x23 或 0x5C，ADDR 脚悬空）
 WiFiClient   net;
 PubSubClient mqtt(net);
 
@@ -85,6 +87,7 @@ uint32_t lastMqttTry   = 0;
 uint32_t lastHeartbeat = 0;
 uint32_t lastTrig      = 0;
 uint32_t activeUntil   = 0;
+uint32_t boarAlarmUntil = 0;        // 野猪报警：这个时刻前 LED+RGB 持续红爆闪
 uint32_t awakeUntil    = 0;          // 本次清醒窗口的截止时刻
 uint32_t mqttReadyAt   = 0;          // MQTT 连上的时刻
 uint32_t lastSerialAct = 0;
@@ -146,6 +149,7 @@ static void printStatus() {
                 bank.sdMounted() ? "/events.csv (SD)" : "内存中(SD未挂载)",
                 elog.timeValid() ? "已同步" : "未同步", elog.buffered());
   Serial.printf("  │ 播放中    : %s\n", playingNow ? playingWhat.c_str() : "否");
+  Serial.printf("  │ 野猪报警  : %s\n", boarAlarmUntil ? "爆闪进行中" : "未激活");
   Serial.printf("  │ 深度睡眠  : %s\n", power.sleepEnabled() ? "启用" : "关闭(调试)");
   Serial.println("  └──────────────────────────────────");
 }
@@ -265,12 +269,21 @@ static void onAiResult(const AiHit &hit) {
   int idx = bank.find(hit.audio);
   const char *logResult = "ai-generic";          // 0.4~0.7：通用驱赶音继续响
   bool switched = false;
-  if (idx >= 0 && policy.enabled && policy.mode != "mute" && hit.conf >= AI_CONF_SPECIFIC) {
+  bool boarMode  = (hit.cls == AN_WILD_BOAR);   // ★ 野猪：直接联动，不看置信度门槛
+  if (idx >= 0 && policy.enabled && policy.mode != "mute" &&
+      (boarMode || hit.conf >= AI_CONF_SPECIFIC)) {
     if (playingNow) stopPlayback();               // 打断通用音效，换专属音频
     switched = playLocal(idx);
     if (switched) {
-      logResult = "ai-start";
-      activeUntil = millis() + policy.holdMs;     // 保持时间重算
+      logResult = boarMode ? "boar-alarm" : "ai-start";
+      if (boarMode) {
+        boarAlarmUntil = millis() + BOAR_ALARM_MS;   // 野猪：爆闪窗口开启
+        activeUntil    = boarAlarmUntil;             // 保持时间对齐报警窗口
+        Serial.printf("[野猪] 专属报警启动：wild_boar.wav + LED/RGB 红爆闪 %lus\n",
+                      (unsigned long)(BOAR_ALARM_MS / 1000));
+      } else {
+        activeUntil = millis() + policy.holdMs;     // 保持时间重算
+      }
       waking = true;
       digitalWrite(PIN_LED, HIGH);
     }
@@ -285,8 +298,8 @@ static void onAiResult(const AiHit &hit) {
   }
   elog.log(zone, hit.audio, logResult, logDetail);
 
-  // ② 专属灯色（未知不亮：unknown 在上面已提前 return）
-  if (rgb.ready()) {
+  // ② 专属灯色（野猪的持续爆闪由主循环接管，这里不再一次性爆闪）
+  if (!boarMode && rgb.ready()) {
     if (policy.flash)
       rgb.strobe(hit.r, hit.g, hit.b, policy.flashCount, policy.flashMs, policy.flashMs);
     else
@@ -501,6 +514,172 @@ static void loopMqtt() {
 }
 
 // ------------------------------------------------------------ 串口命令
+// ------------------------------------------------------------ BH1750/1758 光照
+// 实际接线（BOM）：VCC=3V3 网，GND=共地网，SCL=GPIO7 行，SDA=GPIO8 行，ADDR 悬空
+// ADDR 悬空 → 地址可能落在 0x23（低）或 0x5C（高），两个都试
+// 读法：发 0x10 进入连续高分辨率模式（~120ms 出一次数），lux = raw/1.2
+// 总线上拉补强：若模块自带的 10kΩ 外部上拉因接线/模块掉线而缺失，
+// 只剩内部 ~45kΩ 勉强拉高，配上线电容后上升沿慢到边缘化 → 随机NACK。
+// 显式打开内部上拉，与外部上拉并联，把边沿拉回来。
+static void i2cBoostPullups() {
+  gpio_pullup_en((gpio_num_t)PIN_I2C_SCL);
+  gpio_pullup_en((gpio_num_t)PIN_I2C_SDA);
+}
+
+static bool bh1750Probe() {
+  const uint8_t cand[2] = {0x23, 0x5C};
+  for (uint8_t i = 0; i < 2; i++) {
+    Wire.beginTransmission(cand[i]);
+    if (Wire.endTransmission() == 0) { bhAddr = cand[i]; return true; }
+  }
+  bhAddr = 0;
+  return false;
+}
+static float bh1750ReadLux() {
+  if (!bhAddr) return -1.0f;
+  // ★ 实测规律：紧跟在写后面的读从未失败过；空闲久后的首笔读随机抖。
+  //   所以读失败就先写一笔 0x10（重发测量模式，无副作用）再读 —— 自愈。
+  if (Wire.requestFrom(bhAddr, (uint8_t)2) != 2) {
+    while (Wire.available()) Wire.read();   // 清掉残留，别把胜字节留给下一轮
+    Wire.beginTransmission(bhAddr);
+    Wire.write(0x10);
+    Wire.endTransmission();
+    delay(20);
+    if (Wire.requestFrom(bhAddr, (uint8_t)2) != 2) {
+      while (Wire.available()) Wire.read();
+      return -1.0f;
+    }
+    Serial.println("[BH1750] 首读抖了一下，写后重读成功");
+  }
+  uint16_t raw = ((uint16_t)Wire.read() << 8) | (uint16_t)Wire.read();
+  return (float)raw / 1.2f;
+}
+
+// ------------------------------------------------------------ I2C 深度诊断
+// 现象：写方向正常（0x23 应答探测、OLED 能初始化），读方向全部失败。
+// 目标：把「写行读不行」钉死到具体原因。
+//   ① 空闲电平：SDA/SCL 都该是 1；谁是 0 谁就在拖总线
+//   ② 逐地址探测带耗时：分清应答/不应答/超时
+//   ③ 读空地址 0x50 做对照：正常总线应“秒回NACK”，如果它也超时 → 整条读方向被拖
+//   ④ 9 个 SCL 脉冲的标准总线恢复：把卡在半事务里的从机退出去，看 SDA 能不能释放
+static void i2cDeepDiag(bool withRecover) {
+  Serial.println("[诊断] ▼ I2C 深度诊断");
+  Serial.printf("      空闲电平: SCL(GPIO%d)=%d  SDA(GPIO%d)=%d   (1=正常高, 0=被拉死)\n",
+                PIN_I2C_SCL, digitalRead(PIN_I2C_SCL), PIN_I2C_SDA, digitalRead(PIN_I2C_SDA));
+  // 注：总线空闲电压已实测过 SCL/SDA 均 3180mV → 上拉健康。
+  //   （量电压用的 analogRead 会把引脚切到模拟模式弄坏 I2C，实验已撤，别再加回来）
+  struct { uint8_t a; const char *n; } pr[5] = {
+    {0x23, "BH1750"}, {0x38, "AHT10"}, {0x3C, "OLED"}, {0x40, "INA219"}, {0x50, "空地址对照"}
+  };
+  for (int i = 0; i < 5; i++) {
+    uint32_t t0 = micros();
+    Wire.beginTransmission(pr[i].a);
+    int rc = Wire.endTransmission();
+    Serial.printf("      探测 0x%02X %-9s rc=%d  %uus  (0=应答)\n",
+                  pr[i].a, pr[i].n, rc, (unsigned)(micros() - t0));
+  }
+  if (bhAddr) {
+    uint32_t t0 = micros();
+    Wire.beginTransmission(bhAddr);
+    Wire.write(0x10);                       // 连续高分辨率模式（重发无害）
+    int wrc = Wire.endTransmission();
+    Serial.printf("      写 0x%02X cmd=0x10: rc=%d  %uus  (0=写成功)\n",
+                  bhAddr, wrc, (unsigned)(micros() - t0));
+    t0 = micros();
+    uint8_t n = Wire.requestFrom(bhAddr, (uint8_t)2);
+    uint32_t dt = micros() - t0;
+    if (n == 2) {
+      uint16_t raw = ((uint16_t)Wire.read() << 8) | (uint16_t)Wire.read();
+      Serial.printf("      读 0x%02X 2字节: ✓ raw=0x%04X ≈ %.0f lx  耗时 %uus\n",
+                    bhAddr, raw, raw / 1.2f, (unsigned)dt);
+    } else {
+      while (Wire.available()) Wire.read();
+      Serial.printf("      读 0x%02X 2字节: ✗ 只回 %u 字节  耗时 %uus\n", bhAddr, n, (unsigned)dt);
+      Serial.println("        ↳ ≈50000us=超时(时钟被拉/总线被卡)  <5000us=从机不应答读方向");
+    }
+    t0 = micros();
+    uint8_t n2 = Wire.requestFrom((uint8_t)0x50, (uint8_t)1);
+    while (Wire.available()) Wire.read();
+    Serial.printf("      读空地址 0x50: 回 %u 字节  耗时 %uus  (正常总线应秒回NACK)\n",
+                  n2, (unsigned)(micros() - t0));
+  }
+  if (!withRecover) { Serial.println("[诊断] ▲ 结束（未做恢复）"); return; }
+
+  // —— 标准总线恢复：手打 9 个 SCL 脉冲 + STOP，把卡在半路的从机退出事务 ——
+  Serial.println("      恢复: 手打 9 个 SCL 时钟 ...");
+  Wire.end();
+  pinMode(PIN_I2C_SCL, OUTPUT_OPEN_DRAIN);
+  pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+  digitalWrite(PIN_I2C_SCL, LOW);
+  uint8_t stuck = 0;
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(PIN_I2C_SCL, LOW);  delayMicroseconds(5);
+    digitalWrite(PIN_I2C_SCL, HIGH); delayMicroseconds(5);
+    if (digitalRead(PIN_I2C_SDA) == LOW) stuck++;
+  }
+  pinMode(PIN_I2C_SDA, OUTPUT_OPEN_DRAIN);   // 逆 STOP：SDA 低->高(SCL高时)
+  digitalWrite(PIN_I2C_SDA, LOW);  delayMicroseconds(5);
+  digitalWrite(PIN_I2C_SCL, HIGH); delayMicroseconds(5);
+  digitalWrite(PIN_I2C_SDA, HIGH); delayMicroseconds(5);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  i2cBoostPullups();
+  Serial.printf("      恢复: 9 拍里 SDA 被拽低 %u 次  (0=总线干净, 9=有模块钳死SDA)\n", stuck);
+
+  if (bh1750Probe()) {
+    Wire.beginTransmission(bhAddr);
+    Wire.write(0x10);
+    Wire.endTransmission();
+    delay(180);                               // 等一次测量完成
+    uint8_t n = Wire.requestFrom(bhAddr, (uint8_t)2);
+    if (n == 2) {
+      uint16_t raw = ((uint16_t)Wire.read() << 8) | (uint16_t)Wire.read();
+      Serial.printf("      恢复后读: ✓ raw=0x%04X ≈ %.0f lx → 总线卡死被恢复救活\n", raw, raw / 1.2f);
+    } else {
+      while (Wire.available()) Wire.read();
+      Serial.println("      恢复后读: ✗ 依旧失败 → 不是卡死，是 0x23 从机本身不回读");
+    }
+  } else {
+    Serial.println("      恢复后探测: 0x23/0x5C 都不应答 → 模块掉电/掉线");
+  }
+  Serial.println("[诊断] ▲ 结束");
+}
+
+// ------------------------------------------------------------ I2C 总线扫描（手动 'i' / 心跳自动各调一次）
+// 排障期每 10 秒扫一遍，正常 I2C 设备不受影响；返回应答设备数
+static int scanI2cBus() {
+  Serial.println("[I2C] 总线扫描 (SDA=8 SCL=7, 0x08~0x77) ...");
+  int found = 0;
+  bool inaNow = false;
+  for (uint8_t a = 0x08; a <= 0x77; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      const char *who = "未知设备";
+      switch (a) {
+        case 0x23: who = "BH1750/1758 光照(ADDR=低)"; break;
+        case 0x38: who = "AHT10/20 温湿度";     break;
+        case 0x3C: who = "OLED SSD1306 状态屏"; break;
+        case 0x40: who = "INA219 功耗计";       break;
+        case 0x5C: who = "BH1750/1758 光照(ADDR=高)"; break;
+      }
+      Serial.printf("  ✓ 0x%02X  %s\n", a, who);
+      if (a == 0x40) inaNow = true;
+      found++;
+    }
+  }
+  Serial.printf("[I2C] 扫描完成，共 %d 个应答设备%s\n", found,
+                found ? "" : "（总线全空 → 查 SDA/SCL/VCC/GND 四根线）");
+  // ★ 设备增减当场报出来：插/拔 INA 的实验就靠这个看效果
+  static int  lastFound = -1;
+  static bool lastIna   = false;
+  if (lastFound >= 0 && found != lastFound)
+    Serial.printf("[I2C] ★ 设备数变化: %d -> %d（插拔线/接触不良会这样跳）\n", lastFound, found);
+  if (lastFound >= 0 && inaNow != lastIna)
+    Serial.printf("[I2C] ★ INA219(0x40) %s\n", inaNow ? "已接入总线" : "从总线上消失");
+  lastFound = found;
+  lastIna   = inaNow;
+  return found;
+}
+
 static void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
@@ -519,6 +698,18 @@ static void handleSerial() {
         Serial.println("[CMD] 模拟触发（不分分区）");
         doWake("串口模拟", -1);
         break;
+      case 'v': {
+        Serial.println("[CMD] 模拟 AI 识别结果：野猪 conf=0.90 —— 验证野猪专属联动");
+        AiHit h;
+        h.cls   = AN_WILD_BOAR;
+        h.en    = ANIMAL_EN[AN_WILD_BOAR];
+        h.cn    = ANIMAL_CN[AN_WILD_BOAR];
+        h.audio = ANIMAL_WAV[AN_WILD_BOAR];
+        h.r = 255; h.g = 0; h.b = 0; h.conf = 0.90f;
+        pendingZone = "串口模拟";
+        onAiResult(h);
+        break;
+      }
       case 'g': {
         String a = Serial.readStringUntil('\n');
         a.trim();
@@ -582,6 +773,21 @@ static void handleSerial() {
         Serial.println("[CMD] 手动向视觉板发 {\"cmd\":\"capture\"}（台架联调用）");
         ai.requestCapture("串口");
         break;
+      case 'i':
+        scanI2cBus();
+        break;
+      case 'k':
+        Serial.println("[CMD] PIR 线路三态复测（WiFi 已开无 ADC，仅电平判定）");
+        pir.lineDiag(false);
+        break;
+      case 'm':
+        Serial.println("[CMD] 再开 60 秒 PIR 边沿实时监听");
+        pir.beginMonitor(60000UL);
+        break;
+      case 'd':
+        Serial.println("[CMD] I2C 深度诊断（电平/探测/读写耗时/总线恢复）");
+        i2cDeepDiag(true);
+        break;
       case 'f':
       case 'u': {
         String arg = Serial.readStringUntil('\n');
@@ -613,6 +819,7 @@ static void handleSerial() {
 static bool canSleep() {
   if (!power.sleepEnabled()) return false;
   if (playingNow) return false;                                     // 还在放音
+  if (boarAlarmUntil) return false;                                 // 野猪报警爆闪中
   if (ai.awaiting()) return false;                                  // 还在等视觉板识别结果
   if (hadSerialAct && (millis() - lastSerialAct) < 60000UL) return false;  // 有人在调
   if (millis() < 3000UL) return false;                              // 至少醒 3 秒，让日志出来
@@ -708,11 +915,17 @@ void setup() {
   // 3) PIR：冷启动才需要预热，深睡唤醒立即可用
   pir.begin(power.cause() == WAKE_COLD);
 
+  // 3.5) ★ PIR 线路诊断：赶在 WiFi 射频打开前跑（GPIO15/16 是 ADC2 通道，射频一开就废）
+  //      裸测电压 + 上拉电压 → 直接判出：悬空 / 被驱动 / 被没电模块钳位 / 正在输出
+  pir.lineDiag(true);
+  if (SLEEP_ENABLE == 0) pir.beginMonitor(90000UL);   // 开机前 90 秒边沿实时监听
+
   // 4) RGB 灯带
   rgb.begin();
 
   // 4.5) AHT10 温湿度（I2C：SDA=8 SCL=7，地址 0x38）
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  i2cBoostPullups();                    // ★ 补强 SDA/SCL 内部上拉（实测总线边缘化，先拉稳边沿）
   ahtOk = aht.begin(&Wire);
   if (ahtOk) {
     Serial.println("[AHT10] ✓ 温湿度传感器就绪  SDA=GPIO8 SCL=GPIO7");
@@ -720,10 +933,31 @@ void setup() {
     Serial.println("[AHT10] ✗ 未找到（0x38 无应答）—— 检查 SDA/SCL/VCC/GND 四根线");
   }
 
+  // 4.55) BH1750/1758 光照（与 AHT10 同总线；ADDR 脚悬空，0x23/0x5C 都试）
+  if (bh1750Probe()) {
+    Wire.beginTransmission(bhAddr);
+    Wire.write(0x10);              // 连续高分辨率模式
+    Wire.endTransmission();
+    Serial.printf("[BH1750] ✓ 光照就绪  地址 0x%02X  SDA=GPIO8 SCL=GPIO7\n", bhAddr);
+  } else {
+    Serial.println("[BH1750] ✗ 0x23/0x5C 均无应答 —— 查该模块 SDA/SCL/VCC/GND");
+  }
+
   // 4.7) V2：AI 视觉板链路 + OLED 状态屏（都没接好也不影响 v1 功能）
   ai.begin();
   oled.begin();
+  // ★ Adafruit SSD1306 的 begin() 不检查应答（写指令全部忽略返回值，无条件 return true），
+  //   日志里的“✓就绪”可能是假象 —— 手动补一笔真实探测
+  {
+    Wire.beginTransmission(OLED_ADDR);
+    Serial.printf("[OLED] 真实应答检测 0x%02X: %s  (屏上应该有 Smart Sentinel 字样)\n", OLED_ADDR,
+                  Wire.endTransmission() == 0 ? "有应答 ✓" : "无应答 ✗ → 屏没接/线不对，看屏上有没字");
+  }
   ai.ping();          // 链路自检：视觉板在线会回 pong
+
+  // 4.8) I2C 深度诊断基线：赶在 WiFi 射频打开前跑一轮 ——
+  //     开机能读、10秒后读挂 → 射频干扰/供电跌落；开机就读挂 → 纯总线/器件问题
+  i2cDeepDiag(true);
 
   // 5) 先把上次存的策略读回来（深睡会把 RAM 清空）
   store.begin();
@@ -789,17 +1023,22 @@ void setup() {
     Serial.println("[启动] 定时唤醒：只同步策略，不发声");
     elog.log("boot", "----", "timer-wake");   // 田野里看最后一行就知道节点还活着
   } else {
+#if QUIET_MODE
+    Serial.println("[启动] 冷启动（静音模式：开机提示音已屏蔽）");
+#else
     Serial.println("[启动] 冷启动：响两声开机提示音");
+#endif
     ampEnable(true);
     audio.chime();
     ampEnable(false);
   }
-  Serial.println("[启动] 完成。命令: b试听 c抓拍 t触发 g<1-3>分区 w爆闪 z睡眠开关 p/s/l/e/n/f/u/x/r");
+  Serial.println("[启动] 完成。命令: b试听 c抓拍 i扫I2C d深诊断 k线测 m监听 t触发 v模拟野猪 g<1-3>分区 w爆闪 z睡眠开关 p/s/l/e/n/f/u/x/r");
   Serial.println("[启动] 后台协议: {\"cmd\":\"get_status\"} 等 7 条 JSON 指令，见 docs/20-后台串口协议.md");
 }
 
 void loop() {
   handleSerial();
+  pir.monitorTick();        // V2.1：监听模式边沿实时打印 / 到期自动恢复
 
   // —— V2：AI 视觉板识别结果（异步，二段式驱动的第二段）——
   AiHit aiHit;
@@ -838,11 +1077,36 @@ void loop() {
       else
         snprintf(ahtBuf, sizeof(ahtBuf), "  AHT10=读数失败");
     }
-    Serial.printf("[心跳] 运行中 %lus  WiFi=%s  SD=%s  MQTT=%s%s\n",
+    char bhBuf[32] = "  BH=未接";
+    if (!bhAddr) bh1750Probe();                 // 之前丢了就再找一次（0x23/0x5C）
+    if (bhAddr) {
+      float lx = bh1750ReadLux();               // 内置自愈：首读抖→写一笔再读（实测写后读必活）
+      if (lx < 0) {
+        i2cDeepDiag(true);                     // 写后读都挂 → 深度诊断 + 总线恢复
+        if (!bhAddr) bh1750Probe();
+        if (bhAddr) lx = bh1750ReadLux();
+      }
+      if (lx >= 0) snprintf(bhBuf, sizeof(bhBuf), "  BH1750=%.0flx(0x%02X)", lx, bhAddr);
+      else         snprintf(bhBuf, sizeof(bhBuf), "  BH1750=读取失败(0x%02X)", bhAddr);
+    }
+    Serial.printf("[心跳] 运行中 %lus  WiFi=%s  SD=%s  MQTT=%s%s%s\n",
                   (unsigned long)(millis() / 1000),
                   WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "未连接",
                   bank.sdMounted() ? "已挂载" : "未挂载",
-                  mqtt.connected() ? "在线" : "离线", ahtBuf);
+                  mqtt.connected() ? "在线" : "离线", ahtBuf, bhBuf);
+    Serial.printf("      PIR电平 1号(GPIO%d)=%d  2号(GPIO%d)=%d  3号(GPIO%d)=%d   翻转计数 %lu/%lu/%lu\n",
+                  PIN_PIR_1, digitalRead(PIN_PIR_1),
+                  PIN_PIR_2, digitalRead(PIN_PIR_2),
+                  PIN_PIR_3, digitalRead(PIN_PIR_3),
+                  (unsigned long)pir.rises(0), (unsigned long)pir.rises(1),
+                  (unsigned long)pir.rises(2));
+    // —— 面包板接触边缘化：OLED / AHT10 没就绪就重试 begin，接稳了自动恢复 ——
+    if (!oled.ok()) oled.begin();
+    if (!ahtOk) {
+      ahtOk = aht.begin(&Wire);
+      if (ahtOk) Serial.println("[AHT10] ✓ 重试成功，温湿度恢复");
+    }
+    scanI2cBus();   // ★ 排障期：心跳顺带自动扫一次 I2C，不用手敲 i
   }
 
   // —— TF 卡挂载重试：失败后每 10 秒自动再试（调试模式下无限重试）——
@@ -855,7 +1119,9 @@ void loop() {
     if (bank.retrySD()) {
       elog.setFS(&SD);            // 卡挂上了：事件日志切到 SD，内存缓冲自动补写
     } else if (++sdRetries % 3 == 0) {
-      Serial.println("[SD] 提示：卡要按到底听咔哒声；模块上若焊有 AMS1117 稳压芯片，VCC 必须接 5V 而不是 3V3");
+      // 卡已确认：闪迪 16G / FAT32 / 无 AMS1117（3V3 直供版，接线正确）。
+      // 仍不就绪 = 卡没真正断过电，死在 ACMD41 半初始化态，软复位救不活 → 整机断电重来
+      Serial.println("[SD] 提示：断开 18650 电池 + 拔 USB，等 10 秒，卡重插到底听咔哒声，再上电");
     }
   }
 
@@ -865,7 +1131,11 @@ void loop() {
   if (!selfTestDone && (SLEEP_ENABLE == 0) && power.cause() == WAKE_COLD &&
       millis() > 8000UL) {
     selfTestDone = true;
-    Serial.println("[自检] ▶ 自动演示开始：LED亮 -> RGB爆闪3下 -> 提示音（喇叭未焊，无声属正常）");
+#if QUIET_MODE
+    Serial.println("[自检] ▶ 自动演示开始：LED亮 -> RGB爆闪3下（静音模式，提示音已屏蔽）");
+#else
+    Serial.println("[自检] ▶ 自动演示开始：LED亮 -> RGB爆闪3下 -> 提示音（应能听到两声叮咚）");
+#endif
     digitalWrite(PIN_LED, HIGH);                 // LED 灯珠 GPIO47
     if (rgb.ready())
       rgb.strobe(policy.flashR, policy.flashG, policy.flashB,
@@ -939,6 +1209,29 @@ void loop() {
       stopPlayback();
       activeUntil = millis() + 500;
       ampEnable(false);                   // 放完立刻关功放，省几 mA
+    }
+  }
+
+  // —— 野猪报警窗口：LED + RGB 同步红爆闪（非阻塞，不卡音频流）——
+  if (boarAlarmUntil) {
+    if (playingNow) {                        // 音频还没放完 → 窗口跟着音频延长
+      uint32_t need = millis() + 3000UL;
+      if ((int32_t)(need - boarAlarmUntil) > 0) boarAlarmUntil = need;
+    }
+    if ((int32_t)(millis() - boarAlarmUntil) >= 0) {
+      boarAlarmUntil = 0;
+      digitalWrite(PIN_LED, LOW);
+      if (rgb.ready()) rgb.off();
+      Serial.println("[野猪] 报警窗口结束，停止爆闪");
+    } else {
+      static uint32_t lastBoarTgl = 0;
+      static bool     boarOn      = false;
+      if (millis() - lastBoarTgl >= BOAR_FLASH_MS) {
+        lastBoarTgl = millis();
+        boarOn = !boarOn;
+        digitalWrite(PIN_LED, boarOn);
+        if (rgb.ready()) { if (boarOn) rgb.fill(255, 0, 0); else rgb.off(); }
+      }
     }
   }
 

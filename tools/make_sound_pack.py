@@ -14,6 +14,7 @@
 import argparse
 import math
 import os
+import random
 import struct
 import wave
 
@@ -100,12 +101,39 @@ def hawk(rate, ms=800, amp=0.9):
     return out
 
 
+def boar(rate, grunts=7, amp=0.95):
+    """wild_boar.wav
+    """
+    out = []
+    rng = random.Random(27)
+    for k in range(grunts):
+        ms = 420 + 90 * k
+        n = int(rate * ms / 1000)
+        phase = 0.0
+        base = 105 + 35 * (k % 3)
+        for i in range(n):
+            f = base * (1.0 + 0.16 * math.sin(2 * math.pi * 10.0 * i / rate))
+            phase += 2 * math.pi * f / rate
+            s = math.sin(phase) + 0.55 * math.sin(2.6 * phase) + 0.28 * math.sin(5.1 * phase)
+            breath = (rng.random() - 0.5) * 0.20
+            out.append((s / 1.83 + breath) * env(i, n, 400) * amp * 32767)
+        out.extend([0.0] * int(rate * 0.16))
+    n = int(rate * 850 / 1000)
+    phase = 0.0
+    for i in range(n):
+        phase += 2 * math.pi * (650 + 950 * (i / n)) / rate
+        s = math.sin(phase) + 0.4 * math.sin(2 * phase)
+        out.append(s / 1.4 * env(i, n, 250) * amp * 32767)
+    return out
+
+
 PACK = [
     ("pulse_short.wav", pulse, "短促脉冲 · 通用警觉"),
     ("sweep_high.wav", sweep, "高频扫频 · 针对鸟类"),
     ("low_roar.wav", roar, "低频轰鸣 · 针对野猪/狍子"),
     ("alarm.wav", alarm, "双音警报 · 通用"),
     ("hawk_scream.wav", hawk, "尖啸 · 占位猛禽声"),
+    ("wild_boar.wav", boar, "wild boar: low grunts + squeal"),
 ]
 
 USAGE_NOTE = """

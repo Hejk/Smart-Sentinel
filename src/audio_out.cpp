@@ -94,12 +94,34 @@ bool AudioOut::setSampleRate(uint32_t hz) {
 }
 
 bool AudioOut::write(const int16_t *samples, size_t count) {
+#if QUIET_MODE
+  // 静音模式：写入全 0 帧代替真实 PCM。
+  // I2S 阻塞节奏不变 → wav / 云端音频流的播放时长、loop 推进节奏都和
+  // 正常播放一致，只是喇叭收到的是数字静音。本函数按采样率高频调用，
+  // 不打印任何日志，避免刷屏。
+  if (!_ready || count == 0) return false;
+  static int16_t zbuf[256];
+  memset(zbuf, 0, sizeof(zbuf));
+  size_t off = 0;
+  while (off < count) {
+    size_t n = count - off;
+    if (n > 256) n = 256;
+    i2sWriteAll(zbuf, n);
+    off += n;
+  }
+  return true;
+#endif
   if (!_ready || count == 0) return false;
   i2sWriteAll(samples, count);
   return true;
 }
 
 void AudioOut::tone(uint16_t freq, uint16_t ms) {
+#if QUIET_MODE
+  // 静音模式：不合成、不写 I2S，只在串口留一条痕迹方便确认触发链路活着
+  Serial.printf("[音频] 静音模式：屏蔽提示音 %uHz %ums（QUIET_MODE=1）\n", freq, ms);
+  return;
+#endif
   if (!_ready) return;
   if (_rate != SR_DEFAULT) setSampleRate(SR_DEFAULT);   // 音频流可能改过采样率，切回来
 

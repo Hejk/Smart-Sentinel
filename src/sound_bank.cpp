@@ -4,18 +4,23 @@
 #include <SD.h>
 #include <LittleFS.h>
 #include "config.h"
+#include "soc/io_mux_reg.h"   // PIN_FUNC_SELECT / PIN_INPUT_ENABLE / IO_MUX_GPIOx_REG
 
 // ---------------------------------------------------------------- 挂载
 bool SoundBank::mountSD() {
   Serial.printf("[SD] 挂载 TF 卡  CS=%d SCK=%d MISO=%d MOSI=%d ...\n",
                 PIN_SD_CS, PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI);
-  // ★ 排序原则：上电后第一只碰卡的必须是 400kHz 规范内初始化。
-  //   SD 卡规范：初始化阶段（CMD0~ACMD41）要求 ≤400kHz；而且初始化失败
-  //   的卡必须断电才能重来（软复位无效）。旧顺序是 SD 库先用 4MHz 硬上，
-  //   失败后卡卡死在 idle，之后谁也救不活 —— 诊断证据：CMD0/8 全对、
-  //   ACMD41 卡 40 轮不就绪。
-  _sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+  // ★ ESP32-S3 硬态坑：SPI MISO 走 GPIO matrix 路由时，该 pad 的输入缓冲器
+  //   (FUN_IE) 默认被关掉，SPI 读 MISO 恒为 0（写正常）。只有 MISO 落在
+  //   strapping 脚(GPIO0/3/45/46)才碰巧正常；我们的 MISO=GPIO13 非 strapping，
+  //   所以必须显式把它的输入方向重新拉起来（这不会破坏已建立的 matrix 连接）。
   SD.end();
+  _sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+  pinMode(PIN_SD_MISO, INPUT);   // 使能 MISO pad 输入缓冲器(FUN_IE)
+  // ★ 上面 pinMode 在某些 S3 core 里会被 SPI 初始化覆盖，导致 MISO 读恒 0。
+  //   这里直接写 IO_MUX 寄存器兑底（zephyr#117549 同款修复）：FUN_IE=BIT9。
+  PIN_FUNC_SELECT(IO_MUX_GPIO13_REG, PIN_FUNC_GPIO);
+  PIN_INPUT_ENABLE(IO_MUX_GPIO13_REG);
 
   // ① 400kHz 手动预初始化（首次带诊断日志）—— 把卡拉到“就绪”
   bool warm = sdWarmup(!_initTraced);
@@ -198,6 +203,23 @@ void SoundBank::sdProbe() {
   digitalWrite(PIN_SD_CS, HIGH);
   _sdSPI.endTransaction();
 
+  // 对照实验：换全局 SPI 对象（同为 FSPI 硬件总线）读 MISO，
+  //   排查是不是「自定义 SPIClass _sdSPI{FSPI} 实例」特有的问题。
+  _sdSPI.end();
+  SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+  SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+  digitalWrite(PIN_SD_CS, LOW);
+  uint8_t spig[4];
+  for (int i = 0; i < 4; i++) spig[i] = SPI.transfer(0xFF);
+  digitalWrite(PIN_SD_CS, HIGH);
+  SPI.endTransaction();
+  SPI.end();
+  Serial.printf("[SD]   全局SPI读MISO对照: %02X %02X %02X %02X  %s\n",
+                spig[0], spig[1], spig[2], spig[3],
+                spig[0] == 0xFF ? "✓读到高(问题在自定义实例)" : "✗也读0(问题在SPI底层/硬件/引脚)");
+  _sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
+  pinMode(PIN_SD_MISO, INPUT);
+
   Serial.printf("      CMD0 应答: %02X  尾随: %02X %02X %02X %02X\n", resp, tail[0], tail[1], tail[2], tail[3]);
 
   if (resp == 0x01) {
@@ -208,6 +230,50 @@ void SoundBank::sdProbe() {
     Serial.println("      ✗ MISO 死低：卡没真正接到总线（供电/接地/插槽）");
   } else {
     Serial.println("      ? 有波动但无标准应答，再看一眼接线");
+  }
+
+  // 3) 引脚电平自检：先彻底释放 FSPI 对这几根脚的复用，再改成输入+上拉，
+  //    否则 digitalRead 读到的是 SPI 外设驱动的电平，不是真实外部电平。
+  //    读到 0 = 该线对地短路 / 插到了 GND 孔（最常见）；读到 1 = 正常。
+  _sdSPI.end();
+  Serial.println("[SD]   引脚电平自检（INPUT_PULLUP；0=对地短路/接到GND，1=正常）：");
+  struct { int pin; const char *nm; } sp[4] = {
+    { PIN_SD_CS,   "CS " },
+    { PIN_SD_MOSI, "MOSI" },
+    { PIN_SD_MISO, "MISO" },
+    { PIN_SD_SCK,  "SCK " }
+  };
+  for (int i = 0; i < 4; i++) {
+    pinMode(sp[i].pin, INPUT_PULLUP);
+    delayMicroseconds(50);
+    int v = digitalRead(sp[i].pin);
+    Serial.printf("      %s GPIO%02d = %d  %s\n", sp[i].nm, sp[i].pin, v,
+                  v == 0 ? "◆ 对地短路/接到GND/线短" : "");
+  }
+  // 恢复 CS 为输出高，不影响 10 秒后的下次重试（下次 mountSD 会重新 _sdSPI.begin）
+  pinMode(PIN_SD_CS, OUTPUT);
+  digitalWrite(PIN_SD_CS, HIGH);
+
+  // 4) 模块供电探测：断开内部上拉，用纯输入读 MISO 的静态电平。
+  //    TF 模块板上有一颗 10kΩ 上拉拉在 MISO→VCC：
+  //      读到 1 = 模块有电（板载上拉生效）→ 问题在卡/卡槽/信号线
+  //      读到 0/抖动 = 模块没电（VCC/GND 线不通或插反）
+  //      CS 拉低后再读 = 看卡会不会拉低 MISO（卡活着的另一佐证）
+  pinMode(PIN_SD_MISO, INPUT);          // ★ 纯输入，无内部上拉
+  digitalWrite(PIN_SD_CS, HIGH);        // CS 拉高 = 不选中卡，看模块空闲态
+  delayMicroseconds(100);
+  int m1 = digitalRead(PIN_SD_MISO);
+  digitalWrite(PIN_SD_CS, LOW);         // CS 拉低 = 选中卡
+  delayMicroseconds(100);
+  int m2 = digitalRead(PIN_SD_MISO);
+  digitalWrite(PIN_SD_CS, HIGH);
+  Serial.printf("[SD]   模块供电探测(MISO无上拉)：CS高时=%d  CS低时=%d\n", m1, m2);
+  if (m1 == 0) {
+    Serial.println("      ✗ 模块没电：板载 10k 上拉没生效 → 查 VCC/GND 两根线（头号：模块端插反）");
+  } else if (m2 == 0) {
+    Serial.println("      ★ 模块有电，且 CS 拉低时卡把 MISO 拉低了（卡活着在参与总线！查信号线/速度）");
+  } else {
+    Serial.println("      △ 模块有电（上拉生效），但卡对选片无反应 → 卡未插到底/卡槽接触/卡本身问题");
   }
 }
 
